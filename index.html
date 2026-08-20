@@ -284,11 +284,15 @@
 
     <div id="cr-login-fields-pin" style="display:none;">
       <div class="cr-login-field">
+        <label>Empresa</label>
+        <input type="text" id="cr-login-tenantslug" autocomplete="off" placeholder="ej. bocatta">
+      </div>
+      <div class="cr-login-field">
         <label>Nombre</label>
         <input type="text" id="cr-login-nombre" autocomplete="off" placeholder="Tu nombre">
       </div>
       <div class="cr-login-field">
-        <label>NIP (6 dígitos)</label>
+        <label>NIP (mínimo 4 dígitos)</label>
         <input type="password" inputmode="numeric" maxlength="6" id="cr-login-nip" class="cr-login-pin-input" autocomplete="off" placeholder="••••••">
       </div>
     </div>
@@ -406,6 +410,7 @@
 
   const api = {
     login: (email, password) => apiFetch('/auth/login', {method:'POST', body: JSON.stringify({email, password})}),
+    loginPin: (tenantSlug, nombre, pin) => apiFetch('/auth/login', {method:'POST', body: JSON.stringify({tenantSlug, nombre, pin})}),
 
     insumos: {
       list: () => apiFetch('/insumos'),
@@ -440,16 +445,35 @@
       remove: (id) => apiFetch('/departamentos/' + id, {method:'DELETE'}),
       costoVenta: (id) => apiFetch('/departamentos/' + id + '/costo-venta'),
     },
+    users: {
+      list: () => apiFetch('/users'),
+      create: (dto) => apiFetch('/users', {method:'POST', body: JSON.stringify(dto)}),
+      update: (id, dto) => apiFetch('/users/' + id, {method:'PUT', body: JSON.stringify(dto)}),
+      remove: (id) => apiFetch('/users/' + id, {method:'DELETE'}),
+    },
   };
 
   // ---------- Sesión ----------
-  function saveSession(token, apiBase, email){
+  function decodeJwtPayload(token){
+    try{
+      const base64 = token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+      const json = decodeURIComponent(atob(base64).split('').map(c=>'%'+('00'+c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+      return JSON.parse(json);
+    }catch(e){ return null; }
+  }
+  function currentRole(){
+    if(!authToken) return null;
+    const payload = decodeJwtPayload(authToken);
+    return payload ? payload.roleCode : null;
+  }
+
+  function saveSession(token, apiBase, label){
     authToken = token;
     API_BASE = apiBase;
     try{
       sessionStorage.setItem('cr-token', token);
       sessionStorage.setItem('cr-api-base', apiBase);
-      sessionStorage.setItem('cr-email', email || '');
+      sessionStorage.setItem('cr-label', label || '');
     }catch(e){ /* modo privado o similar: la sesión no sobrevive un refresh, no pasa nada grave */ }
   }
 
@@ -467,7 +491,7 @@
     try{
       sessionStorage.removeItem('cr-token');
       sessionStorage.removeItem('cr-api-base');
-      sessionStorage.removeItem('cr-email');
+      sessionStorage.removeItem('cr-label');
     }catch(e){}
   }
 
@@ -477,17 +501,18 @@
     document.getElementById('cr-loading-screen').classList.add('cr-app-hidden');
     document.getElementById('cr-login-screen').classList.remove('cr-app-hidden');
     document.getElementById('cr-login-password').value = '';
+    document.getElementById('cr-login-nip').value = '';
   }
 
-  async function doLogin(email, password, apiBase){
+  async function completeLogin(loginFn, apiBase, label){
     const errEl = document.getElementById('cr-login-error');
     errEl.classList.remove('show');
     const btn = document.getElementById('cr-login-submit');
     btn.disabled = true; btn.textContent = 'Entrando…';
     try{
-      API_BASE = apiBase || DEFAULT_API_BASE;
-      const res = await api.login(email, password);
-      saveSession(res.access_token, API_BASE, email);
+      API_BASE = apiBase || DEFAULT_API_BASE; // debe fijarse ANTES de llamar loginFn, apiFetch lee este valor al momento de llamar
+      const res = await loginFn();
+      saveSession(res.access_token, API_BASE, label);
       await bootApp();
     }catch(e){
       errEl.textContent = e.message || 'No se pudo iniciar sesión.';
@@ -495,6 +520,14 @@
     }finally{
       btn.disabled = false; btn.textContent = 'Entrar';
     }
+  }
+
+  async function doLogin(email, password, apiBase){
+    await completeLogin(() => api.login(email, password), apiBase, email);
+  }
+
+  async function doLoginPin(tenantSlug, nombre, pin, apiBase){
+    await completeLogin(() => api.loginPin(tenantSlug, nombre, pin), apiBase, nombre);
   }
 
   // ============================================================
@@ -630,12 +663,16 @@
     {key:"platillos", label:"Platillos"},
     {key:"bebidas", label:"Bebidas"},
     {key:"resumen", label:"Resumen"},
+    {key:"usuarios", label:"Usuarios", soloAdmin:true},
   ];
   let activeTab = "dashboard";
 
   function renderTabs(){
     const el = document.getElementById("cr-tabs");
-    el.innerHTML = TABS.map(t=>
+    const role = currentRole();
+    const esAdmin = role === 'OWNER' || role === 'ADMIN';
+    const visibles = TABS.filter(t => !t.soloAdmin || esAdmin);
+    el.innerHTML = visibles.map(t=>
       `<button class="cr-tab ${activeTab===t.key?'active':''}" data-tab="${t.key}">${t.label}</button>`
     ).join("");
     el.querySelectorAll(".cr-tab").forEach(btn=>{
@@ -1425,6 +1462,114 @@
   // ============================================================
   // RENDER PRINCIPAL
   // ============================================================
+  // ============================================================
+  // USUARIOS — solo visible/usable para OWNER/ADMIN. El backend
+  // vuelve a validar el rol en cada llamada (nunca confiar solo en el frontend).
+  // ============================================================
+  function renderUsuarios(list){
+    const rows = list.map(u=>`
+      <tr data-id="${u.id}">
+        <td>${esc(u.nombre)}</td>
+        <td class="cr-readonly" style="font-size:11px;">${esc(u.email)}</td>
+        <td><select data-f="roleCode">
+          <option value="OWNER" ${u.roleCode==='OWNER'?'selected':''}>Dueño</option>
+          <option value="ADMIN" ${u.roleCode==='ADMIN'?'selected':''}>Administrador</option>
+          <option value="STAFF" ${u.roleCode==='STAFF'?'selected':''}>Staff</option>
+        </select></td>
+        <td>${u.isActive?'<span class="cr-resumen-badge badge-ok">Activo</span>':'<span class="cr-resumen-badge badge-bad">Inactivo</span>'}</td>
+        <td><input class="cr-input-inline wide" data-f="pin" type="text" inputmode="numeric" maxlength="6" placeholder="Nuevo NIP"/></td>
+        <td>
+          <button class="cr-icon-btn" data-savepin="${u.id}" title="Guardar NIP nuevo">💾</button>
+          <button class="cr-icon-btn" data-toggle="${u.id}" title="${u.isActive?'Desactivar':'Reactivar'}">${u.isActive?'⏸':'▶'}</button>
+        </td>
+      </tr>`).join('');
+    return `
+    <div class="cr-panel">
+      <h2>Usuarios</h2>
+      <p class="cr-desc">Solo dueños/administradores ven esta pestaña. Para acceso rápido con Nombre + NIP no captures correo — el sistema genera uno interno solo, sin que la persona tenga que saberlo.</p>
+      <table class="cr-table">
+        <thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Estado</th><th>Nuevo NIP</th><th></th></tr></thead>
+        <tbody id="users-tbody">${rows || '<tr><td colspan="6" class="cr-empty">Sin usuarios todavía.</td></tr>'}</tbody>
+      </table>
+      <div class="cr-card" style="margin-top:18px;">
+        <div class="cr-card-head" style="border-bottom:none;margin-bottom:6px;">
+          <div class="cr-field cr-field-name"><label>Nombre</label><input id="new-user-nombre" placeholder="Nombre"/></div>
+          <div class="cr-field"><label>Rol</label>
+            <select id="new-user-role">
+              <option value="STAFF">Staff</option>
+              <option value="ADMIN">Administrador</option>
+              <option value="OWNER">Dueño</option>
+            </select>
+          </div>
+        </div>
+        <div style="display:flex;gap:14px;flex-wrap:wrap;">
+          <div class="cr-field" style="flex:1;min-width:200px;"><label>Correo (opcional, acceso con contraseña)</label><input id="new-user-email" type="email" placeholder="correo@ejemplo.com"/></div>
+          <div class="cr-field" style="flex:1;min-width:150px;"><label>Contraseña (si diste correo)</label><input id="new-user-password" type="password" placeholder="mínimo 8 caracteres"/></div>
+          <div class="cr-field" style="flex:1;min-width:130px;"><label>NIP (opcional, acceso rápido)</label><input id="new-user-pin" type="text" inputmode="numeric" maxlength="6" placeholder="ej. 482915"/></div>
+        </div>
+        <div class="cr-actions-row"><button class="cr-btn" id="add-user">+ Agregar usuario</button></div>
+      </div>
+    </div>`;
+  }
+
+  function bindUsuarios(){
+    document.getElementById('add-user').addEventListener('click', async ()=>{
+      const nombre = document.getElementById('new-user-nombre').value.trim();
+      const roleCode = document.getElementById('new-user-role').value;
+      const email = document.getElementById('new-user-email').value.trim();
+      const password = document.getElementById('new-user-password').value;
+      const pin = document.getElementById('new-user-pin').value.trim();
+      if(!nombre){ toast('Escribe un nombre'); return; }
+      if(!email && !pin){ toast('Da de alta con correo+contraseña, con NIP, o ambos'); return; }
+      const dto = {nombre, roleCode};
+      if(email){ dto.email = email; if(password) dto.password = password; }
+      if(pin){ dto.pin = pin; }
+      try{
+        await api.users.create(dto);
+        toast('Usuario creado');
+        renderUsuariosTab();
+      }catch(e){ toast(e.message); }
+    });
+
+    document.querySelectorAll('#users-tbody tr[data-id]').forEach(tr=>{
+      const id = tr.dataset.id;
+      const roleSelect = tr.querySelector('[data-f=roleCode]');
+      roleSelect.addEventListener('change', async ()=>{
+        try{ await api.users.update(id, {roleCode: roleSelect.value}); toast('Rol actualizado'); }
+        catch(e){ toast(e.message); renderUsuariosTab(); }
+      });
+      const toggleBtn = tr.querySelector('[data-toggle]');
+      toggleBtn.addEventListener('click', async ()=>{
+        const vaADesactivar = toggleBtn.title.indexOf('Desactivar') === 0;
+        try{
+          if(vaADesactivar) await api.users.remove(id);
+          else await api.users.update(id, {isActive:true});
+          renderUsuariosTab();
+        }catch(e){ toast(e.message); }
+      });
+      const savePinBtn = tr.querySelector('[data-savepin]');
+      savePinBtn.addEventListener('click', async ()=>{
+        const pinInput = tr.querySelector('[data-f=pin]');
+        const val = pinInput.value.trim();
+        if(!val){ toast('Escribe el NIP nuevo primero'); return; }
+        try{ await api.users.update(id, {pin: val}); toast('NIP actualizado'); pinInput.value=''; }
+        catch(e){ toast(e.message); }
+      });
+    });
+  }
+
+  async function renderUsuariosTab(){
+    const el = document.getElementById('cr-content');
+    el.innerHTML = '<div class="cr-panel"><h2>Usuarios</h2><p class="cr-desc">Cargando…</p></div>';
+    try{
+      const list = await api.users.list();
+      el.innerHTML = renderUsuarios(list);
+      bindUsuarios();
+    }catch(e){
+      el.innerHTML = `<div class="cr-panel"><h2>Usuarios</h2><p class="cr-desc">${esc(e.message)}</p></div>`;
+    }
+  }
+
   function renderContent(){
     renderTabs();
     const el = document.getElementById("cr-content");
@@ -1440,6 +1585,7 @@
       bindMenuSheet("BEBIDA", {foodCostObjetivo:22, margenObjetivo:300});
     }
     else if(activeTab==="resumen"){ el.innerHTML = renderResumen(); }
+    else if(activeTab==="usuarios"){ renderUsuariosTab(); }
   }
 
   // ============================================================
@@ -1465,18 +1611,10 @@
     }
   }
 
-  // ---------- Acceso rápido "Nombre y NIP" ----------
-  // Por dentro el sistema sigue usando correo+contraseña (así está construido el backend).
-  // Este directorio traduce un nombre a su correo interno, y el NIP se convierte en una
-  // contraseña más larga con un sufijo fijo (para cumplir el mínimo de 8 caracteres que
-  // pide el servidor) — la persona nunca ve ni teclea nada de esto, solo su nombre y su NIP.
-  // Para agregar a alguien más: súmalo aquí con su nombre exacto y su correo interno.
-  const NIP_DIRECTORIO = {
-    'Luisa': 'luisa@bocatta.local',
-  };
-  const NIP_SUFIJO = '-nip6-estia';
-  function nipToPassword(nip){ return nip + NIP_SUFIJO; }
-
+  // ---------- Acceso rápido "Empresa + Nombre + NIP" ----------
+  // Ya no hay ningún directorio "quemado" en el código — el servidor resuelve
+  // el nombre dentro del tenant (empresa) indicado y valida el NIP directamente.
+  // Dar de alta gente nueva se hace desde la pestaña "Usuarios" del sistema.
   let loginMode = 'email';
   function setLoginMode(mode){
     loginMode = mode;
@@ -1496,20 +1634,15 @@
       const errEl = document.getElementById('cr-login-error');
 
       if(loginMode === 'pin'){
+        const tenantSlug = document.getElementById('cr-login-tenantslug').value.trim();
         const nombre = document.getElementById('cr-login-nombre').value.trim();
         const nip = document.getElementById('cr-login-nip').value.trim();
-        if(!nombre || !nip){
-          errEl.textContent = 'Escribe tu nombre y tu NIP.';
+        if(!tenantSlug || !nombre || !nip){
+          errEl.textContent = 'Escribe la empresa, tu nombre y tu NIP.';
           errEl.classList.add('show');
           return;
         }
-        const email = NIP_DIRECTORIO[nombre];
-        if(!email){
-          errEl.textContent = 'Ese nombre no está registrado. Revisa que esté escrito igual que te lo dieron.';
-          errEl.classList.add('show');
-          return;
-        }
-        doLogin(email, nipToPassword(nip), apiUrl || DEFAULT_API_BASE);
+        doLoginPin(tenantSlug, nombre, nip, apiUrl || DEFAULT_API_BASE);
         return;
       }
 
