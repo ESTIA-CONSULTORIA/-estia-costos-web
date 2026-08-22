@@ -882,7 +882,7 @@
       <h2>Subrecetas</h2>
       <p class="cr-desc">Recetas base que se preparan primero y luego se usan dentro de tus platillos y bebidas. El rendimiento final es la cantidad que queda YA TERMINADA la preparación.</p>
       <div id="sub-cards">${cards}</div>
-      <div class="cr-actions-row"><button class="cr-btn" id="add-sub">+ Agregar subreceta</button></div>
+      <div class="cr-actions-row"><button class="cr-btn secondary" id="csv-recetas">⇪ Cargar CSV</button><button class="cr-btn" id="add-sub">+ Agregar subreceta</button></div>
     </div>`;
   }
 
@@ -895,7 +895,7 @@
       <h2>${titulo}</h2>
       <p class="cr-desc">${desc}</p>
       <div id="menu-cards">${cards}</div>
-      <div class="cr-actions-row"><button class="cr-btn" id="add-item" data-tipo="${tipo}">+ Agregar ${titulo.toLowerCase().replace(/s$/,'')}</button></div>
+      <div class="cr-actions-row"><button class="cr-btn secondary" id="csv-recetas">⇪ Cargar CSV</button><button class="cr-btn" id="add-item" data-tipo="${tipo}">+ Agregar ${titulo.toLowerCase().replace(/s$/,'')}</button></div>
     </div>`;
   }
 
@@ -965,6 +965,7 @@
   }
 
   function bindSubrecetas(){
+    document.getElementById("csv-recetas").addEventListener("click", ()=> openCsvModal("recetas"));
     document.getElementById("add-sub").addEventListener("click", async ()=>{
       if(!state.insumos.length){ toast("Primero agrega al menos un insumo"); return; }
       try{
@@ -982,6 +983,7 @@
   }
 
   function bindMenuSheet(tipo, defaults){
+    document.getElementById("csv-recetas").addEventListener("click", ()=> openCsvModal("recetas"));
     document.getElementById("add-item").addEventListener("click", async ()=>{
       const list = listaComponentes(null);
       if(!list.length){ toast("Primero agrega al menos un insumo"); return; }
@@ -1397,6 +1399,111 @@
         const dtos = rows.map(r=>({fecha:r.fecha, proveedor:r.proveedor, folio:r.folio, departamentoId:r.departamentoId, formaPago:r.formaPago, importe:r.importe}));
         await api.compras.bulk(dtos);
       }
+    },
+    recetas: {
+      titulo: "Carga masiva de Subrecetas, Platillos y Bebidas",
+      desc: "Cada fila es UN ingrediente. Si una receta tiene varios ingredientes, repite su nombre en varias filas. Los insumos (y las subrecetas que uses como ingrediente) deben existir ya en el sistema. Las subrecetas se crean antes que los platillos/bebidas automáticamente, sin que tengas que ordenar el archivo.",
+      plantilla: "receta,tipo,categoria,unidad rendimiento,rendimiento,porciones,ingrediente,cantidad,food cost objetivo,margen objetivo,precio final\nCarne Seca (base),subreceta,Bases,kg,1.8,,Bistec de res,5,,,\nCarne Seca (base),subreceta,Bases,kg,1.8,,Sal de mesa,0.15,,,\nCarne Seca (base),subreceta,Bases,kg,1.8,,Limón,0.3,,,\nCarne Seca (base),subreceta,Bases,kg,1.8,,Chile piquín molido,0.05,,,\nTostada de Carne Seca,platillo,Entrada,pieza,,1,Carne Seca (base),0.06,30,200,95\n",
+      plantillaNombre: "plantilla_recetas.csv",
+      previewCols: ["receta","tipo","ingrediente","cantidad"],
+      mapRow(r){
+        const receta = pickField(r, ["receta","nombre","nombre de la receta"]);
+        const ingrediente = pickField(r, ["ingrediente","insumo","componente"]);
+        const cantidad = pickField(r, ["cantidad"]);
+        if(!receta || !ingrediente || cantidad === "") return null;
+        return {
+          receta,
+          tipo: pickField(r, ["tipo"]) || "subreceta",
+          categoria: pickField(r, ["categoria","categoría"]),
+          unidadRendimiento: pickField(r, ["unidad rendimiento","unidad de salida","unidad"]),
+          rendimiento: pickField(r, ["rendimiento"]),
+          porciones: pickField(r, ["porciones"]),
+          ingrediente,
+          cantidad,
+          costosAdicionalesPct: pickField(r, ["costos adicionales","costos adicionales %"]),
+          foodCostObjetivo: pickField(r, ["food cost objetivo","food cost objetivo %"]),
+          margenObjetivo: pickField(r, ["margen objetivo","margen objetivo %"]),
+          precioFinal: pickField(r, ["precio final","precio de venta","precio de venta final"]),
+        };
+      },
+      // A diferencia de insumos/compras (una fila = un registro), aquí varias filas
+      // forman UNA receta. Se agrupan por (tipo+nombre), se ordenan subrecetas
+      // primero (por si un platillo depende de una), y se crean una por una
+      // resolviendo cada ingrediente contra lo que ya existe + lo recién creado.
+      async apply(rows){
+        const grupos = new Map();
+        const orden = [];
+        rows.forEach(r=>{
+          const tipoNorm = (r.tipo||"").toUpperCase();
+          const tipo = ["SUBRECETA","PLATILLO","BEBIDA"].includes(tipoNorm) ? tipoNorm : "SUBRECETA";
+          const key = tipo + "::" + normHeader(r.receta);
+          if(!grupos.has(key)){
+            grupos.set(key, {
+              nombre: r.receta, tipo,
+              categoria: r.categoria || "",
+              unidadRendimiento: UNIDADES_RENDIMIENTO.includes((r.unidadRendimiento||"").toLowerCase()) ? r.unidadRendimiento.toLowerCase() : (tipo==="SUBRECETA"?"kg":"pieza"),
+              rendimiento: n(r.rendimiento) || 1,
+              porciones: n(r.porciones) || 1,
+              costosAdicionalesPct: r.costosAdicionalesPct !== "" ? n(r.costosAdicionalesPct) : 15,
+              foodCostObjetivo: r.foodCostObjetivo !== "" ? n(r.foodCostObjetivo) : (tipo==="BEBIDA"?22:30),
+              margenObjetivo: r.margenObjetivo !== "" ? n(r.margenObjetivo) : 200,
+              precioFinal: n(r.precioFinal) || 0,
+              ingredientesRaw: [],
+            });
+            orden.push(key);
+          }
+          grupos.get(key).ingredientesRaw.push({ingrediente:r.ingrediente, cantidad:n(r.cantidad)});
+        });
+
+        const clavesOrdenadas = orden.slice().sort((a,b)=>{
+          const pa = a.startsWith("SUBRECETA")?0:1;
+          const pb = b.startsWith("SUBRECETA")?0:1;
+          return pa-pb;
+        });
+
+        const insumoIdPorNombre = new Map(state.insumos.map(i=>[normHeader(i.nombre), i.id]));
+        const subrecetaIdPorNombre = new Map(state.recipes.filter(r=>r.tipo==="SUBRECETA").map(r=>[normHeader(r.nombre), r.id]));
+        const existePorClave = new Set(state.recipes.map(r=>r.tipo+"::"+normHeader(r.nombre)));
+
+        let creadas = 0, existentes = 0, conAdvertencias = 0;
+
+        for(const key of clavesOrdenadas){
+          const g = grupos.get(key);
+          if(existePorClave.has(key)){ existentes++; continue; }
+
+          const items = [];
+          let huboAdvertencia = false;
+          g.ingredientesRaw.forEach(ing=>{
+            const k2 = normHeader(ing.ingrediente);
+            if(insumoIdPorNombre.has(k2)){
+              items.push({insumoId: insumoIdPorNombre.get(k2), cantidad: ing.cantidad});
+            } else if(subrecetaIdPorNombre.has(k2)){
+              items.push({componentRecipeId: subrecetaIdPorNombre.get(k2), cantidad: ing.cantidad});
+            } else {
+              huboAdvertencia = true;
+            }
+          });
+          if(huboAdvertencia) conAdvertencias++;
+          if(!items.length) continue;
+
+          const creado = await api.recipes.create({
+            nombre: g.nombre, categoria: g.categoria, tipo: g.tipo,
+            unidadRendimiento: g.unidadRendimiento, rendimiento: g.rendimiento, porciones: g.porciones,
+            costosAdicionalesPct: g.costosAdicionalesPct, foodCostObjetivo: g.foodCostObjetivo,
+            margenObjetivo: g.margenObjetivo, precioFinal: g.precioFinal, items
+          });
+          creadas++;
+          existePorClave.add(key);
+          if(g.tipo === "SUBRECETA") subrecetaIdPorNombre.set(normHeader(g.nombre), creado.id);
+        }
+        return {creadas, existentes, conAdvertencias};
+      },
+      toastMsg(resultado){
+        let msg = `${resultado.creadas} recetas creadas`;
+        if(resultado.existentes) msg += `, ${resultado.existentes} ya existían (omitidas)`;
+        if(resultado.conAdvertencias) msg += `, ${resultado.conAdvertencias} con algún ingrediente no encontrado`;
+        return msg;
+      }
     }
   };
 
@@ -1450,11 +1557,11 @@
       if(!csvContext || !csvContext.parsedRows || !csvContext.parsedRows.length) return;
       const cfg = CSV_CONFIGS[csvContext.tipo];
       try{
-        await cfg.apply(csvContext.parsedRows);
-        const cantidad = csvContext.parsedRows.length;
+        const resultado = await cfg.apply(csvContext.parsedRows);
+        const totalFilas = csvContext.parsedRows.length;
         closeCsvModal();
         await refreshAndRender();
-        toast(`${cantidad} filas importadas correctamente`);
+        toast(cfg.toastMsg ? cfg.toastMsg(resultado) : `${totalFilas} filas importadas correctamente`);
       }catch(e){ toast(e.message); }
     });
   }
@@ -1676,4 +1783,3 @@
 </script>
 </body>
 </html>
-<!-- prueba de despliegue automatico via token, Fri Aug 21 05:16:14 UTC 2026 -->
